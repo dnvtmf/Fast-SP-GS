@@ -1,0 +1,372 @@
+""" OpenGL coordinate transformation 三维坐标变换
+
+世界空间World space和观察空间view space为右手系
+(OpenGL坐标系) RUB，+x向右手边, +y指向上方, +z指向屏幕外 (MeshLab, Open3D)
+    y
+    ↑
+    |
+    |
+    .-------> x
+   ↙
+  z
+裁剪空间Clip space为左手系: +x指向右手边, +y 指向上方, +z指向屏幕内; z 的坐标值越小，距离观察者越近
+y [-1, 1]
+↑
+|   z [-1, 1]
+| ↗
+.------> x [-1, 1]
+屏幕坐标系： X 轴向右为正，Y 轴向下为正，坐标原点位于窗口的左上角 (左手系: z轴向屏幕内，表示深度)
+    z
+  ↗
+.------> x
+|
+|
+↓
+y
+坐标变换矩阵: T{s}2{d} Transform from {s} space to {d} space
+{s} 和 {d} 包括世界World坐标系、观察View坐标系、裁剪Clip坐标系、屏幕Screen坐标
+
+Tv2s即相机内参，Tw2v即相机外参
+"""
+
+from typing import Tuple, Union, Any, Sequence, Optional
+import math
+
+import torch
+import numpy as np
+from torch import Tensor
+
+from utils import to_tensor, show_shape
+from .misc import normalize
+from .coord_trans_common import fov_to_focal, focal_to_fov
+from .xfm import apply
+
+TensorType = Union[float, int, np.ndarray, Tensor]
+
+
+## 世界坐标系相关
+def coord_spherical_to(radius: TensorType, thetas: TensorType, phis: TensorType) -> Tensor:
+    """ 球坐标系 转 笛卡尔坐标系
+
+    Args:
+        radius: 径向半径 radial distance, 原点O到点P的距离 [0, infity]
+        thetas: 极角 polar angle, 朝上(+y轴)与连线OP的夹角 [0, pi]
+        phis: 方位角 azimuth angle, 正x轴与连线OP在xz平面的投影的夹角, [0, 2 * pi], 顺时针, +z：0.5pi
+    Returns:
+        Tensor: 点P的笛卡尔坐标系, shape: [..., 3]
+    """
+    radius = to_tensor(radius, dtype=torch.float32)
+    thetas = to_tensor(thetas, dtype=torch.float32)
+    phis = to_tensor(phis, dtype=torch.float32)
+    # yapf: disable
+    return torch.stack([
+        radius * torch.sin(thetas) * torch.cos(phis),
+        radius * torch.cos(thetas),
+        radius * torch.sin(thetas) * torch.sin(phis),
+    ], dim=-1)
+    # yapf: enable
+
+
+def coord_to_spherical(points: Tensor):
+    """ 笛卡尔坐标系(OpenGL) 转 球坐标系
+
+    Args:
+        points (Tensor): 点P的笛卡尔坐标系, shape: [..., 3]
+
+    Returns:
+        Tuple[Tensor, Tensor, Tensor]: 点P的球坐标系: 径向半径、极角和方位角
+    """
+    raduis = points.norm(p=2, dim=-1)  # type: Tensor
+    thetas = torch.arccos(points[..., 1] / raduis)
+    phis = torch.arctan2(points[..., 2], points[..., 0])
+    return raduis, thetas, phis
+
+
+## 相机坐标系相关
+def look_at(eye: Tensor, at: Tensor = None, up: Tensor = None, inv=False) -> Tensor:
+    if at is None:
+        dir_vec = torch.zeros_like(eye)
+        dir_vec[..., 2] = -1.
+    else:
+        dir_vec = normalize((eye - at))
+
+    if up is None:
+        up = torch.zeros_like(dir_vec)
+        # if dir is parallel with y-axis, up dir is z axis, otherwise is y-axis
+        y_axis = dir_vec.new_tensor([0, 1., 0]).expand_as(dir_vec)
+        y_axis = torch.cross(dir_vec, y_axis, dim=-1).norm(dim=-1, keepdim=True) < 1e-6
+        up = torch.scatter_add(up, -1, y_axis + 1, 1 - y_axis.to(up.dtype) * 2)
+    shape = eye.shape
+    right_vec = normalize(torch.cross(up, dir_vec, dim=-1))  # 相机空间x轴方向
+    up_vec = torch.cross(dir_vec, right_vec, dim=-1)  # 相机空间y轴方向
+    if inv:
+        Tv2w = torch.eye(4, device=eye.device, dtype=eye.dtype).expand(*shape[:-1], -1, -1).contiguous()
+        Tv2w[..., :3, 0] = right_vec
+        Tv2w[..., :3, 1] = up_vec
+        Tv2w[..., :3, 2] = dir_vec
+        Tv2w[..., :3, 3] = eye
+        return Tv2w
+    else:
+        R = torch.eye(4, device=eye.device, dtype=eye.dtype).expand(*shape[:-1], -1, -1).contiguous()
+        T = torch.eye(4, device=eye.device, dtype=eye.dtype).expand(*shape[:-1], -1, -1).contiguous()
+        R[..., 0, :3] = right_vec
+        R[..., 1, :3] = up_vec
+        R[..., 2, :3] = dir_vec
+        T[..., :3, 3] = -eye
+        world2view = R @ T
+        return world2view
+
+
+def look_at_get(Tv2w: Tensor):
+    eye = Tv2w[..., :3, 3]
+    right_vec = Tv2w[..., :3, 0]
+    up_vec = Tv2w[..., :3, 1]
+    dir_vec = Tv2w[..., :3, 2]
+    return eye, eye - dir_vec, up_vec  # torch.cross(dir_vec, right_vec, dim=-1)
+
+
+def camera_intrinsics(
+    focal: Union[float, None, Tensor, Sequence[float]] = None,
+    cx_cy: Union[float, None, Tensor, Sequence[float]] = None,
+    size: Union[float, None, Tensor, Sequence[float]] = None,
+    fov: Union[float, None, Tensor, Sequence[float]] = np.pi,
+    inv: bool = False,
+    **kwargs
+) -> Tensor:
+    """生成相机内参K/Tv2s, 请注意坐标系
+    .---> u
+    |
+    ↓
+    v
+    Args:
+        focal: focal length, shape: [..., 1] or shape: [..., 2]
+        cx_cy: principal points, shape: [..., 2]
+        size: image size
+        fov: filed of view, shape: [..., 1] or [..., 2]
+        inv: if True, return Ts2v, else Tv2s
+        kwargs: the kwargs for output matrix
+    Returns:
+         Tensor, shape: [..., 3, 3]
+    """
+    W, H = size
+    if cx_cy is None:
+        cx, cy = 0.5 * W, 0.5 * H
+    elif isinstance(cx_cy, Tensor):
+        cx, cy = cx_cy.unbind(-1)
+    else:
+        cx, cy = cx_cy
+    if focal is None:
+        if isinstance(fov, float):
+            focal_x = fov_to_focal(fov, W)
+            focal_y = fov_to_focal(fov, H)
+        elif isinstance(fov, Tensor):
+            if fov.shape[-1] == 2:
+                focal_x = fov_to_focal(fov[..., 0], W)
+                focal_y = fov_to_focal(fov[..., 1], W)
+            else:
+                focal_x = fov_to_focal(fov[..., 0], W)
+                focal_y = fov_to_focal(fov[..., 0], W)
+        else:
+            focal_x = fov_to_focal(fov[0], W)
+            focal_y = fov_to_focal(fov[1], H)
+    elif isinstance(focal, Tensor):
+        if focal.ndim > 0 and focal.shape[-1] == 2:
+            focal_x, focal_y = focal.unbind(-1)
+        else:
+            focal_x, focal_y = focal.squeeze(-1), focal.squeeze(-1)
+    else:
+        focal_x, focal_y = focal, focal
+    shape = [x.shape for x in [focal_x, focal_y, cx, cy] if isinstance(x, Tensor)]
+    if len(shape) > 0:
+        shape = list(torch.broadcast_shapes(*shape))
+    if inv:  # Ts2v
+        Ts2v = torch.zeros(shape + [3, 3], **kwargs)
+        Ts2v[..., 0, 0] = -1. / focal_x
+        Ts2v[..., 0, 2] = cx / focal_x
+        Ts2v[..., 1, 1] = focal_y
+        Ts2v[..., 1, 2] = -cy / focal_y
+        Ts2v[..., 2, 2] = 1
+        return Ts2v
+    else:
+        K = torch.zeros(shape + [3, 3], **kwargs)  # Tv2s
+        K[..., 0, 0] = -focal_x
+        K[..., 0, 2] = cx
+        K[..., 1, 1] = focal_y
+        K[..., 1, 2] = cy
+        K[..., 2, 2] = 1
+        return K
+
+
+# @try_use_C_extension
+def perspective(fovy=0.7854, aspect=1.0, n=0.1, f=1000.0, device=None, size=None, z01=False):
+    # type: (Union[Tensor, float], float, float, float, Any, Optional[Tuple[int, int]], bool)->Tensor
+    """透视投影矩阵
+
+    Args:
+        fovy: 弧度. Defaults to 0.7854.
+        aspect: 长宽比W/H. Defaults to 1.0.
+        n: near. Defaults to 0.1.
+        f: far. Defaults to 1000.0.
+        device: Defaults to None.
+        size: (W, H)
+        z01: project z to [0, 1] or [-1, 1]
+
+    Returns:
+        Tensor: 透视投影矩阵
+    """
+    shape = []
+    if size is not None:
+        aspect = size[0] / size[1]
+    for x in [fovy, aspect, n, f]:
+        if isinstance(x, Tensor):
+            shape = x.shape
+    Tv2c = torch.zeros(*shape, 4, 4, device=device)
+    y = torch.tan(fovy * 0.5) if isinstance(fovy, Tensor) else np.tan(fovy * 0.5)
+    Tv2c[..., 0, 0] = 1. / (y * aspect)
+    Tv2c[..., 1, 1] = 1. / y
+    if z01:
+        Tv2c[..., 2, 2] = -f / (f - n)
+        Tv2c[..., 2, 3] = -(f * n) / (f - n)
+    else:
+        Tv2c[..., 2, 2] = -(f + n) / (f - n)
+        Tv2c[..., 2, 3] = -(2 * f * n) / (f - n)
+    Tv2c[..., 3, 2] = -1
+    return Tv2c
+
+
+def perspective2(size, focals=None, FoV=None, pp=None, near_far=(0.1, 1000.), device=None, z01=False):
+    """OpenGL 透视投影矩阵
+
+    Args:
+        size (int | Tuple[int, int]): (W, H)
+        focals (float | list | tuple | Tensor): focal length, shape: [...], [..., 1], [..., 2]
+        FoV (float | list | tuple | Tensor): filed of view, radians (e.g, pi), shape: [...], [..., 1], [..., 2]
+        pp (float | list | tuple | Tensor): position of center, shape: [...], [..., 1], [..., 2]
+        near_far ( list | tuple | Tensor): near. Defaults to (0.1, 1000.)
+        device: Defaults to None.
+        z01: project z to [0, 1] or [-1, 1]
+    Returns:
+        Tensor: 透视投影矩阵
+    """
+    shape = torch.Size([])
+    focals, FoV, pp, near_far = [to_tensor(x, device=device) for x in [focals, FoV, pp, near_far]]
+    for x in [focals, FoV, pp, near_far]:
+        if isinstance(x, Tensor):
+            if x.ndim > 0 and x.shape[-1] in [1, 2]:
+                shape = torch.broadcast_shapes(shape, x.shape[:-1])
+            else:
+                shape = torch.broadcast_shapes(shape, x.shape)
+    Tv2c = torch.zeros(*shape, 4, 4, device=device)
+    W, H = size
+
+    if pp is None:
+        cx, cy = W / 2, H / 2
+    else:
+        if pp.ndim > 0 and pp.shape[-1] <= 2:
+            cx, cy = pp[..., 0], pp[..., 1 if pp.shape[-1] == 2 else 0]
+        else:
+            cx, cy = pp, pp
+
+    if FoV is not None:
+        if FoV.ndim > 0 and FoV.shape[-1] <= 2:
+            fx = fov_to_focal(FoV[..., 0], W)
+            fy = fov_to_focal(FoV[..., 1 if FoV.shape[-1] == 2 else 0], H)
+        else:
+            fx = fov_to_focal(FoV, W)
+            fy = fov_to_focal(FoV, H)
+    else:
+        assert focals is not None
+        if focals.ndim > 0 and focals.shape[-1] <= 2:
+            fx, fy = focals[..., 0], focals[..., -1]
+        else:
+            fx = fy = focals
+    n, f = near_far.unbind(-1)
+
+    z_sign = -1.0
+    Tv2c[..., 0, 0] = 2.0 * fx / W
+    Tv2c[..., 1, 1] = 2.0 * fy / H
+    Tv2c[..., 0, 2] = (W - 2.0 * cx) / W
+    Tv2c[..., 1, 2] = (2.0 * cy - H) / H
+    if z01:
+        Tv2c[..., 2, 2] = z_sign * f / (f - n)
+        Tv2c[..., 2, 3] = -(f * n) / (f - n)
+    else:
+        Tv2c[..., 2, 2] = z_sign * (f + n) / (f - n)
+        Tv2c[..., 2, 3] = -(2 * f * n) / (f - n)
+    Tv2c[..., 3, 2] = z_sign
+    return Tv2c
+
+
+# @try_use_C_extension
+def ortho(l=-1., r=1.0, b=-1., t=1.0, n=0.1, f=1000.0, device=None):
+    """正交投影矩阵
+
+    Args:
+        # size: 长度. Defaults to 1.0.
+        # aspect: 长宽比W/H. Defaults to 1.0.
+        l: left plane
+        r: right plane
+        b: bottom place
+        t: top plane
+        n: near. Defaults to 0.1.
+        f: far. Defaults to 1000.0.
+        device: Defaults to None.
+
+    Returns:
+        Tensor: 正交投影矩阵
+    """
+    # yapf: disable
+    return torch.tensor([
+        [2 / (r - l), 0, 0, (l + r) / (l - r)],
+        [0, 2 / (t - b), 0, (b + t) / (b - t)],
+        [0, 0, 2 / (n - f), (n + f) / (n - f)],
+        [0, 0, 0, 1],
+    ], dtype=torch.float32, device=device)
+    # return torch.tensor([
+    #     [1 / (size * aspect), 0, 0, 0],
+    #     [0, 1 / size, 0, 0],
+    #     [0, 0, -(f + n) / (f - n), -(f + n) / (f - n)],
+    #     [0, 0, 0, 0],
+    # ], dtype=torch.float32, device=device)
+    # yapf: enable
+
+
+def ndc2pixel(ndc: Tensor, size: Tuple[int, int]):
+    if ndc.shape[-1] == 4:
+        ndc = ndc[..., :3] / ndc[..., 3:]
+    pixel = torch.zeros_like(ndc[..., :2])
+    pixel[..., 0] = (1 + ndc[..., 0]) * 0.5 * size[0]  # - 0.5
+    pixel[..., 1] = (1 - ndc[..., 1]) * 0.5 * size[1]  # - 0.5
+    return pixel
+
+
+def point2pixel(
+    points: Tensor, Tw2v: Tensor = None, Tv2s: Tensor = None, Tv2c: Tensor = None, Tw2c: Tensor = None,
+    size: Tuple[int, int] = None
+):
+    """ convert 3D points to <pixels, depths>
+    Args:
+        points (Tensor):  containing 3D points with shape [..., 3] or [..., 4]
+        Tw2v (Union[None, Tensor]): world to view space transformation matrix with shape [..., 4, 4]
+        Tv2s (Optional[Tensor]): view to screen space transformation matrix with shape [..., 3, 3]
+        Tv2c (Optional[Tensor]): view to clip space transformation matrix with shape [..., 4, 4]
+        Tw2c (Optional[Tensor]): world to clip space transformation matrix with shape [..., 4, 4]
+        size (Optional[Tuple[int, int]]): (W, H)
+    Returns:
+        (Tensor, Tensor): pixel containing 2D pixel with shape [..., 2] and depth: [...]
+    """
+    if points.shape[-1] == 3:
+        points = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)  # to homo
+    if Tw2v is not None:
+        points = apply(points, Tw2v)
+    if Tv2s is not None:
+        # camera_distort( points[..., :2] / points[..., 2:3])
+        points = apply(points[..., :3], Tv2s)
+        pixel = points[..., :2] / points[..., 2:3]
+        return pixel, points[..., 2]
+    else:
+        ndc = apply(points, Tv2c)
+        pixel = torch.zeros_like(ndc[..., :2])
+        pixel[..., 0] = (1 + ndc[..., 0] / ndc[..., 3]) * 0.5 * size[0]  # - 0.5
+        pixel[..., 1] = (1 - ndc[..., 1] / ndc[..., 3]) * 0.5 * size[1]  # - 0.5
+        return pixel, points[..., 2]

@@ -1,0 +1,7 @@
+STRING(REGEX REPLACE "^.+/(.+)$" "\\1" LIB_NAME ${CMAKE_CURRENT_SOURCE_DIR})
+set(SRC_FILES)
+aux_source_directory(./ SRC_FILES)
+LIST(LENGTH SRC_FILES num_files)
+message(STATUS "sub library ${LIB_NAME} have ${num_files} source files")
+cuda_add_library(${LIB_NAME} STATIC ${SRC_FILES})
+set(SUB_LIBS ${SUB_LIBS} "${LIB_NAME}" PARENT_SCOPE)

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Fast SP-GS"
+version = "0.1.0"
+description = "The offical implemention of \"Fast SP-GS: Reconstructing Dynamic Scenes in Minutes\""
+authors = [
+    {name = "Diwen Wan", email = "wandw@eaircas.ac.cn"}
+]
+dependencies = [
+    "torch",
+    "dearpygui",
+    "opencv-python",
+    "matplotlib",
+]

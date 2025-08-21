@@ -1,0 +1,110 @@
+exp_name: SP_2D_GS/DNeRF
+arch_cfg:
+  render_method: '2d_gs_my' # '3d_gs', '3d_gs_my', '2d_gs', '2d_gs_my', 2d_gs_fast
+  sh_degree: 3
+  deform_net_name: 'sc_gs'
+  deform_net_cfg:
+    pos_enc_p: 'freq'
+    pos_enc_p_cfg: {degree: 10}
+    pos_enc_t: 'freq'
+    pos_enc_t_cfg: {degree: 6}
+    width: 256
+    depth: 8
+    skips: [4,]
+    sep_rot: true
+    is_blender: true
+  train_schedule:
+    init_fix: 2_000
+    init: 8_000
+    sp_fix: 3_000
+    sp: 67_000
+  num_knn: 3
+  canonical_time_id: -1
+  ## superpoints
+  num_superpoints: 512
+  hyper_dim: 8
+  max_d_scale: -1.0
+  init_sp_step: 7500
+  init_same_scale: 'none'
+  init_sp_from: 'before'
+  node_max_num_ratio_during_init: 16
+  LBS_method: weighted_kernel
+  warp_method: LBS_c
+  smooth_time_steps: -1 # 20_000
+  ## other
+  test_time_interpolate: false
+  ## learning rate
+  lr_position_init: 0.16
+  lr_position_final: 1.6e-3
+  lr_position_delay_mult: 0.01
+  lr_position_max_steps: 30_000
+  lr_deform_max_steps: 40_000
+  lr_deform_scale: 1.0
+  depth_reinit_steps: []
+  simplify_steps: [-3000, -8000, -13000]
+  adaptive_control_cfg:
+    opacity_reset_interval: [3000, 0, 35_000]
+    densify_interval: [100, 500, 35_000]
+    prune_interval: [100, 500, 35_000]
+    init_opacity_reset_interval: [3000, 3000, -1]
+    init_densify_interval: [100, 100, -1]
+
+    densify_grad_threshold: 0.0002
+    densify_percent_dense: 0.01
+    prune_opacity_threshold: 0.005
+    prune_max_screen_size: 20
+    prune_percent_dense: 0.1
+
+    sp_adjust_interval: [-1, 10_000, 20_000]
+    sp_merge_interval: [-1, 20_000, 30_000]
+    aggressive_clone_interval: [-250, 500, 3000]
+    blur_split: false
+  loss_cfg:
+    default: 0.0
+    image: {method: l1, lambda: 0.8}
+    ssim: 0.2
+    arap:
+      lambda: 0
+      _values: [1.0e-2, 1.0e-2, 1.0e-4, 1.0e-4, 1.0e-5, 1.0e-5, 0]
+      _steps: [2000, 10000, 10000, 15000, 20000, 30000, 30001]
+      _vary: log
+    acc:
+      lambda: 0
+      _values: [0, 1.0e-5, 0]
+      _steps: [0, 10000, 10000]
+      _vary: fix
+    elastic:
+      lambda: 0
+      _values: [0, 1.0e-3, 0]
+      _steps: [0, 10000, 10000]
+      _vary: fix
+    flow: 0
+  loss_flow_fix_camera: false
+  which_rotation: 'quaternion'
+  apply_rotation: 'add'
+## dataset
+scene: jumpingjacks
+dataset: DNeRF
+dataset_cfg:
+  background: "black"
+  batch_mode: true
+  coord_src: opengl
+  coord_dst: colmap
+  use_time: true
+  with_rays: false
+  downscale: 2
+## solver
+num_init_points: 2_000
+use_spare_adam: false
+optimizer_cfg:
+  eps: 1.0e-15
+  betas: [0.9, 0.999]
+
+epochs: 40_000
+eval_interval: 5_000
+metric: image/PSNR
+metrics: [image, loss]
+metric_goal: max
+
+vis_interval: 5000
+checkpoint_interval: 5000
