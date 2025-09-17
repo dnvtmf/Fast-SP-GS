@@ -45,7 +45,6 @@ def parse_ply(filename):
     """ parse a ply file
     reference: http://gamma.cs.unc.edu/POWERPLANT/papers/ply.pdf
     """
-    # TODO: implement use C++
     error_msg = f"can not load ply file {filename}"
     with open(filename, 'rb') as f:
         ##### load header

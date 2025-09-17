@@ -228,8 +228,6 @@ class NerfiesDataset(NERF_Base_Dataset):
             self.image_size = tuple(camera_info['image_size'])  # noqa
             paths.append(root.joinpath(self.img_dir, img_name + img_suffix))
             principal_points.append([v / self.downscale for v in camera_info['principal_point']])
-            # camera_info['radial_distortion']
-            # camera_info['tangential_distortion'] # TODO: 相机畸变
         Tw2v[:, 3, 3] = 1
         # self.Tw2v = ops_3d.convert_coord_system_matrix(self.Tw2v, self.coord_src, self.coord_dst)
         Tw2v = ops_3d.convert_coord_system(Tw2v, self.coord_src, self.coord_dst)

@@ -180,7 +180,6 @@ class DyNeRFDataset(NERF_Base_Dataset):
         self.time_ids = torch.tensor(time_ids)
 
         print(f'begin loading {len(paths)} images...')
-        # TODO: 多线程加载数据
         if debug:
             self.images = torch.zeros(len(paths), 1014, 1352, 3)  # for debug
         else:

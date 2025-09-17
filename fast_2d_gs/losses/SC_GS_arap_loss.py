@@ -106,7 +106,7 @@ def cal_laplacian(Nv, ii, jj, nn):
     laplacian_mat = torch.zeros(Nv, Nv).cuda()
     laplacian_mat[ii, jj] = -1
     for idx in ii:
-        laplacian_mat[idx, idx] += 1  # TODO test whether it is correct
+        laplacian_mat[idx, idx] += 1
     return laplacian_mat
 
 

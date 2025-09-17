@@ -374,7 +374,7 @@ class GaussianTrainTask:
         self.optimizer.zero_grad(set_to_none=True)  # set_to_none=True here can modestly improve performance
 
         if utils.check_interval(self.step + 1, self.cfg.vis_interval, self.cfg.epochs):
-            gt = targets['images'][..., :3]
+            gt = targets['images'][..., :3].squeeze()
             gt = gt[0] if gt.ndim == 4 else gt
             image = outputs['images']
             image = image[0] if image.ndim == 4 else image
